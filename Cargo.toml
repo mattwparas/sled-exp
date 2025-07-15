@@ -1,0 +1,14 @@
+[package]
+name = "sled-exp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+sled = { git = "https://github.com/spacejam/sled.git" }
+datafusion = "45"
+async-trait = "*"
+arrow-schema = "*"
+arrow-array = "*"
+arrow = "*"
+tokio = { version = "1", features = ["full"] }
+futures = "*"
