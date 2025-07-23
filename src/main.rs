@@ -1,5 +1,6 @@
 use std::{
     any::Any,
+    collections::HashMap,
     io::Cursor,
     sync::{Arc, Mutex},
 };
@@ -26,16 +27,78 @@ use datafusion::{
     prelude::Expr,
 };
 use futures::StreamExt;
-use sled::Db;
+use sled::{Db, Tree};
 
 #[derive(Debug, Clone)]
 struct SledDb {
     db: Arc<Mutex<Db<1024>>>,
+    schemas: Arc<Mutex<Tree<1024>>>,
+    // TODO: Cache these tables?
+    open_tables: HashMap<String, Arc<SledTable>>,
+}
+
+impl SledDb {
+    pub fn new(config: &sled::Config) -> std::io::Result<Self> {
+        let db = Db::open_with_config(config)?;
+        let schemas = db.open_tree("schemas")?;
+
+        Ok(Self {
+            db: Arc::new(Mutex::new(db)),
+            schemas: Arc::new(Mutex::new(schemas)),
+            open_tables: HashMap::new(),
+        })
+    }
+
+    fn get_schema_for_table(&self, table: &str) -> std::io::Result<Option<SchemaRef>> {
+        let guard = self.schemas.lock().unwrap();
+        let schema = guard.get(table)?;
+
+        if let Some(schema) = schema {
+            let (schema, _) = bincode::serde::decode_from_slice::<Schema, _>(
+                &schema,
+                bincode::config::standard(),
+            )
+            .unwrap();
+
+            Ok(Some(Arc::new(schema)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    // Create a new table
+    fn register_table(&self, table: &str, schema: SchemaRef) -> std::io::Result<()> {
+        let guard = self.schemas.lock().unwrap();
+        let encoded = bincode::serde::encode_to_vec(schema, bincode::config::standard()).unwrap();
+        guard.insert(table, encoded)?;
+        Ok(())
+    }
+
+    pub fn get_table(&self, name: &str) -> std::io::Result<Option<SledTable>> {
+        let guard = self.db.lock().unwrap();
+
+        let schema = self.get_schema_for_table(name)?;
+        if let Some(schema) = schema {
+            guard.open_tree(name).map(|db| {
+                Some(SledTable {
+                    db: Arc::new(Mutex::new(db)),
+                    schema,
+                })
+            })
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SledTable {
+    db: Arc<Mutex<Tree<1024>>>,
     schema: SchemaRef,
 }
 
 #[async_trait]
-impl TableProvider for SledDb {
+impl TableProvider for SledTable {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -70,7 +133,7 @@ impl TableProvider for SledDb {
 }
 
 impl CustomExec {
-    fn new(projections: Option<&Vec<usize>>, schema: SchemaRef, db: SledDb) -> Self {
+    fn new(projections: Option<&Vec<usize>>, schema: SchemaRef, db: SledTable) -> Self {
         let projected_schema = project_schema(&schema, projections).unwrap();
 
         let properties = {
@@ -95,7 +158,7 @@ impl CustomExec {
     }
 }
 
-impl SledDb {
+impl SledTable {
     pub(crate) async fn create_physical_plan(
         &self,
         projections: Option<&Vec<usize>>,
@@ -121,7 +184,7 @@ impl SledDb {
 
 #[derive(Debug)]
 struct CustomInsertIntoExec {
-    db: SledDb,
+    db: SledTable,
     schema: SchemaRef,
     properties: PlanProperties,
     insert_op: InsertOp,
@@ -132,7 +195,7 @@ struct CustomInsertIntoExec {
 impl CustomInsertIntoExec {
     fn new(
         schema: SchemaRef,
-        db: SledDb,
+        db: SledTable,
         input: Arc<dyn ExecutionPlan>,
         insert_op: InsertOp,
     ) -> Self {
@@ -258,7 +321,7 @@ fn make_count_schema() -> SchemaRef {
 
 #[derive(Debug)]
 struct CustomExec {
-    db: SledDb,
+    db: SledTable,
     projected_schema: SchemaRef,
     properties: PlanProperties,
 }
@@ -337,21 +400,23 @@ use datafusion::execution::context::SessionContext;
 
 #[tokio::main]
 async fn main() {
-    let db: Db<1024> = Db::open_with_config(&sled::Config::new().path("test.db")).unwrap();
     let schema = Arc::new(Schema::new(vec![Field::new(
         "foo",
         datafusion::arrow::datatypes::DataType::Int64,
         false,
     )]));
 
-    let sled = SledDb {
-        db: Arc::new(Mutex::new(db)),
-        schema,
-    };
+    let config = sled::Config::new().path("test.db");
 
+    let sled = SledDb::new(&config).unwrap();
+    sled.register_table("foo", schema.clone()).unwrap();
+
+    // Register tables into their own namespace:
     let ctx = SessionContext::new();
 
-    ctx.register_table("foo", Arc::new(sled)).unwrap();
+    let table = sled.get_table("foo").unwrap().unwrap();
+
+    ctx.register_table("foo", Arc::new(table)).unwrap();
 
     let df = ctx
         .sql(

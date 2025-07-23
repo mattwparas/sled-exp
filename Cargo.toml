@@ -5,10 +5,13 @@ edition = "2024"
 
 [dependencies]
 sled = { git = "https://github.com/spacejam/sled.git" }
-datafusion = "45"
+datafusion = { version = "48", features = ["serde"] }
 async-trait = "*"
 arrow-schema = "*"
 arrow-array = "*"
+arrow-row = "*"
+arrow-csv = "*"
 arrow = "*"
 tokio = { version = "1", features = ["full"] }
 futures = "*"
+bincode = { version = "2", features = ["serde"] }
