@@ -56,39 +56,6 @@ use arrow::datatypes::{DataType, IntervalUnit};
 use bincode::Decode;
 use bincode::Encode;
 
-// use arrow::datatypes::{ArrowNativeType, BooleanType};
-//
-// impl ArrowPrimitiveType for Date32Type
-// impl ArrowPrimitiveType for Date64Type
-// impl ArrowPrimitiveType for Decimal128Type
-// impl ArrowPrimitiveType for Decimal256Type
-// impl ArrowPrimitiveType for DurationMicrosecondType
-// impl ArrowPrimitiveType for DurationMillisecondType
-// impl ArrowPrimitiveType for DurationNanosecondType
-// impl ArrowPrimitiveType for DurationSecondType
-// impl ArrowPrimitiveType for Float16Type
-// impl ArrowPrimitiveType for Float32Type
-// impl ArrowPrimitiveType for Float64Type
-// impl ArrowPrimitiveType for Int8Type
-// impl ArrowPrimitiveType for Int16Type
-// impl ArrowPrimitiveType for Int32Type
-// impl ArrowPrimitiveType for Int64Type
-// impl ArrowPrimitiveType for IntervalDayTimeType
-// impl ArrowPrimitiveType for IntervalMonthDayNanoType
-// impl ArrowPrimitiveType for IntervalYearMonthType
-// impl ArrowPrimitiveType for Time32MillisecondType
-// impl ArrowPrimitiveType for Time32SecondType
-// impl ArrowPrimitiveType for Time64MicrosecondType
-// impl ArrowPrimitiveType for Time64NanosecondType
-// impl ArrowPrimitiveType for TimestampMicrosecondType
-// impl ArrowPrimitiveType for TimestampMillisecondType
-// impl ArrowPrimitiveType for TimestampNanosecondType
-// impl ArrowPrimitiveType for TimestampSecondType
-// impl ArrowPrimitiveType for UInt8Type
-// impl ArrowPrimitiveType for UInt16Type
-// impl ArrowPrimitiveType for UInt32Type
-// impl ArrowPrimitiveType for UInt64Type
-
 // TODO: Wrap all the interval times!
 struct WIntervalDayTime {}
 
