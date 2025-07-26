@@ -53,6 +53,7 @@ use arrow_schema::{Schema, SchemaBuilder};
 // datafusion types.
 
 use arrow::datatypes::{DataType, IntervalUnit};
+use bincode::BorrowDecode;
 use bincode::Decode;
 use bincode::Encode;
 use sled::Tree;
@@ -60,7 +61,7 @@ use sled::Tree;
 // TODO: Wrap all the interval times!
 struct WIntervalDayTime {}
 
-#[derive(Encode, Decode)]
+#[derive(Encode, Decode, Debug, Clone)]
 pub enum ArrowPrimitiveValue {
     Null,
 
@@ -117,27 +118,148 @@ struct TableGuard<'a> {
     tree: &'a mut Tree<1024>,
 }
 
-// These will be stored per leaf. Key -> Value
-// should make it easier to get the information
-enum BatchKind {
-    // Insert a batch when pushing down a full table.
-    RecordBatch(RecordBatch),
-    // Separately, alongside that record batch, we just need
-    // to store indexed values against the records.
-    RowSet(Vec<ArrowRow>),
+// How to figure out the keys when writing record batches in?
+//
+// Lock the database from the writer. The database itself will be locked
+// via a mutex so that we can guarantee that we're the only ones
+// accessing it. At the start of our lock, we get all of the things that
+// we want to, meaning the row offsets and counts that we need for book keeping.
+//
+// We then constructs a batch which holds all of the things that we want.
+// in this case, this will be:
+//
+// Splitting up the record batches into their respective columns, and then
+// writing them back to the store. We'll atomically write everything, with
+// reads up front to be reasonably quick.
+#[repr(C)]
+#[derive(Encode, BorrowDecode, Debug)]
+enum KeyKind<'a> {
+    // Column will have some name. We want to get to everything
+    // that matches a specific column.
+    Column {
+        name: &'a [u8],
+        row_offset: usize,
+        key: Option<bool>,
+    },
 
-    // Index into the row set
-    Index(Vec<u8>, usize),
+    // Row will be indexed via primary key.
+    Row {
+        key: &'a [u8],
+    },
+
+    // Primary key for a record batch. Optionally can
+    // index into a record batch in order to tell us
+    // which offset will be there.
+    RecordBatchIndex {
+        name: &'a str,
+    },
 }
 
-// Prefix... with the proper values?
-impl Encode for BatchKind {
-    fn encode<E: bincode::enc::Encoder>(
-        &self,
-        encoder: &mut E,
-    ) -> Result<(), bincode::error::EncodeError> {
-        todo!()
+#[repr(C)]
+#[derive(Encode, BorrowDecode)]
+enum KeyKindQuery<'a> {
+    Column { name: &'a [u8] },
+    Row { key: &'a [u8] },
+    RecordBatchIndex { name: &'a str },
+}
+
+#[test]
+fn test_keys() {
+    let db = sled::open("test.db").unwrap();
+    db.insert(
+        bincode::encode_to_vec(
+            KeyKind::Column {
+                name: "foo".as_bytes(),
+                row_offset: 0,
+                key: Some(true),
+            },
+            bincode::config::standard(),
+        )
+        .unwrap(),
+        bincode::encode_to_vec(
+            ValueKind::Row(ArrowRow {
+                values: vec![ArrowPrimitiveValue::Int32(10)],
+            }),
+            bincode::config::standard(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    db.insert(
+        bincode::encode_to_vec(
+            KeyKind::Column {
+                name: "foo".as_bytes(),
+                row_offset: 100,
+                key: Some(true),
+            },
+            bincode::config::standard(),
+        )
+        .unwrap(),
+        bincode::encode_to_vec(
+            ValueKind::Row(ArrowRow {
+                values: vec![ArrowPrimitiveValue::Int32(100)],
+            }),
+            bincode::config::standard(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    db.insert(
+        bincode::encode_to_vec(
+            KeyKind::Column {
+                name: "foo".as_bytes(),
+                row_offset: 200,
+                key: Some(true),
+            },
+            bincode::config::standard(),
+        )
+        .unwrap(),
+        bincode::encode_to_vec(
+            ValueKind::Row(ArrowRow {
+                values: vec![ArrowPrimitiveValue::Int32(1000)],
+            }),
+            bincode::config::standard(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    let prefix = bincode::encode_to_vec(
+        KeyKindQuery::Column {
+            name: "foo".as_bytes(),
+        },
+        bincode::config::standard(),
+    )
+    .unwrap();
+
+    for value in db.scan_prefix(&prefix) {
+        let (key, value) = value.unwrap();
+
+        let decode_key: (KeyKind<'_>, _) =
+            bincode::borrow_decode_from_slice(&key, bincode::config::standard()).unwrap();
+
+        let decode_value: ValueKind =
+            bincode::decode_from_slice(&value, bincode::config::standard())
+                .unwrap()
+                .0;
+
+        println!("{:?} -> {:?}", decode_key, decode_value);
     }
+}
+
+#[derive(Encode, Decode, Debug)]
+enum ValueKind {
+    // TODO: Implement encoding logic here!
+    // Each column will be encoded in its own record batch
+    // Column(RecordBatch),
+
+    // Separately encode a row, if the row was inserted on its own
+    Row(ArrowRow),
+
+    // Global counter for the number of rows in the table
+    Counter(usize),
 }
 
 pub fn add_column_to_record_batch(batch: RecordBatch) -> Result<RecordBatch, ArrowError> {
@@ -311,7 +433,7 @@ pub fn batch_to_rows(batch: &RecordBatch) -> Vec<ArrowRow> {
 }
 
 // Convert columnar to arrow
-#[derive(Encode, Decode)]
+#[derive(Encode, Decode, Debug)]
 pub struct ArrowRow {
     values: Vec<ArrowPrimitiveValue>,
 }
