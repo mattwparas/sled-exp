@@ -1,4 +1,3 @@
-use std::io::Cursor;
 use std::sync::Arc;
 
 use arrow::array::AsArray;
@@ -44,6 +43,7 @@ use arrow_schema::ArrowError;
 use arrow_schema::Field;
 use arrow_schema::FieldRef;
 use arrow_schema::Fields;
+use arrow_schema::SchemaRef;
 use arrow_schema::TimeUnit;
 use arrow_schema::UnionFields;
 use arrow_schema::UnionMode;
@@ -55,6 +55,7 @@ use arrow_schema::{Schema, SchemaBuilder};
 use arrow::datatypes::{DataType, IntervalUnit};
 use bincode::Decode;
 use bincode::Encode;
+use sled::Tree;
 
 // TODO: Wrap all the interval times!
 struct WIntervalDayTime {}
@@ -104,17 +105,48 @@ pub enum ArrowPrimitiveValue {
     String(String),
 }
 
+// Table State, this is morally just understanding the row counts based
+// on how much has been written.
+struct TableState {
+    schema: SchemaRef,
+    row_count: usize,
+}
+
+struct TableGuard<'a> {
+    schema: SchemaRef,
+    tree: &'a mut Tree<1024>,
+}
+
+// These will be stored per leaf. Key -> Value
+// should make it easier to get the information
+enum BatchKind {
+    // Insert a batch when pushing down a full table.
+    RecordBatch(RecordBatch),
+    // Separately, alongside that record batch, we just need
+    // to store indexed values against the records.
+    RowSet(Vec<ArrowRow>),
+
+    // Index into the row set
+    Index(Vec<u8>, usize),
+}
+
+// Prefix... with the proper values?
+impl Encode for BatchKind {
+    fn encode<E: bincode::enc::Encoder>(
+        &self,
+        encoder: &mut E,
+    ) -> Result<(), bincode::error::EncodeError> {
+        todo!()
+    }
+}
+
 pub fn add_column_to_record_batch(batch: RecordBatch) -> Result<RecordBatch, ArrowError> {
     let rows = batch_to_rows(&batch);
     let (mut schema, mut items, _) = batch.into_parts();
 
-    let schema_mut = Arc::make_mut(&mut schema);
-
-    let mut fields = schema_mut.fields.iter().cloned().collect::<Vec<_>>();
-    fields.push(Arc::new(Field::new("__row", DataType::LargeBinary, false)));
-    let new_fields = Fields::from_iter(fields);
-
-    schema_mut.fields = new_fields;
+    let mut schema_builder = SchemaBuilder::from(schema.fields());
+    schema_builder.push(Field::new("__row", DataType::LargeBinary, false));
+    schema = Arc::new(schema_builder.finish());
 
     let bytes = rows
         .into_iter()
