@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -121,6 +122,53 @@ struct TableGuard<'a> {
     tree: &'a mut Tree<1024>,
 }
 
+pub static ROW_COUNT_KEY: std::sync::LazyLock<Vec<u8>> =
+    std::sync::LazyLock::new(|| KeyKind::RowCount { name: "#%rowcount" }.encode());
+
+impl<'a> TableGuard<'a> {
+    // The table needs to be locked for this whole duration.
+    pub fn write_batch(&mut self, batch: RecordBatch) -> Result<(), ArrowError> {
+        // Check that the schemas are correct
+        debug_assert!(batch.schema_ref() == &self.schema);
+
+        // TODO: Insert #%rowcount into table first!
+        let row_count = self.tree.get(ROW_COUNT_KEY.as_slice()).unwrap().unwrap();
+        let row_count: usize = bincode::decode_from_slice(&row_count, bincode::config::standard())
+            .unwrap()
+            .0;
+
+        let mut sled_batch = sled::Batch::default();
+
+        let batch_row_count = batch.num_rows();
+
+        // This is our new offset
+        let batches = split_record_batch(batch)?;
+
+        for batch in batches {
+            let key = KeyKind::Column {
+                name: batch.schema().fields().first().unwrap().name().as_str(),
+                // Offset from the beginning
+                row_offset: row_count,
+            }
+            .encode();
+
+            let value = encode_record_batch(&batch).unwrap();
+
+            sled_batch.insert(key, value);
+        }
+
+        sled_batch.insert(
+            ROW_COUNT_KEY.as_slice(),
+            bincode::encode_to_vec(row_count + batch_row_count, bincode::config::standard())
+                .unwrap(),
+        );
+
+        self.tree.apply_batch(sled_batch).unwrap();
+
+        Ok(())
+    }
+}
+
 // How to figure out the keys when writing record batches in?
 //
 // Lock the database from the writer. The database itself will be locked
@@ -139,23 +187,24 @@ struct TableGuard<'a> {
 enum KeyKind<'a> {
     // Column will have some name. We want to get to everything
     // that matches a specific column.
-    Column {
-        name: &'a [u8],
-        row_offset: usize,
-        key: Option<bool>,
-    },
+    Column { name: &'a str, row_offset: usize },
 
     // Row will be indexed via primary key.
-    Row {
-        key: &'a [u8],
-    },
+    Row { key: &'a [u8] },
 
     // Primary key for a record batch. Optionally can
     // index into a record batch in order to tell us
     // which offset will be there.
-    RecordBatchIndex {
-        name: &'a str,
-    },
+    RecordBatchIndex { name: &'a str },
+
+    RowCount { name: &'a str },
+}
+
+impl<'a> KeyKind<'a> {
+    // Encode the key kind
+    pub fn encode(&self) -> Vec<u8> {
+        bincode::encode_to_vec(&self, bincode::config::standard()).unwrap()
+    }
 }
 
 #[repr(C)]
@@ -172,9 +221,8 @@ fn test_keys() {
     db.insert(
         bincode::encode_to_vec(
             KeyKind::Column {
-                name: "foo".as_bytes(),
+                name: "foo",
                 row_offset: 0,
-                key: Some(true),
             },
             bincode::config::standard(),
         )
@@ -192,9 +240,8 @@ fn test_keys() {
     db.insert(
         bincode::encode_to_vec(
             KeyKind::Column {
-                name: "foo".as_bytes(),
+                name: "foo",
                 row_offset: 100,
-                key: Some(true),
             },
             bincode::config::standard(),
         )
@@ -212,9 +259,8 @@ fn test_keys() {
     db.insert(
         bincode::encode_to_vec(
             KeyKind::Column {
-                name: "foo".as_bytes(),
+                name: "foo",
                 row_offset: 200,
-                key: Some(true),
             },
             bincode::config::standard(),
         )
