@@ -137,7 +137,8 @@ impl CustomExec {
         let projected_schema = project_schema(&schema, projections).unwrap();
 
         let properties = {
-            let eq_properties = datafusion::physical_expr::EquivalenceProperties::new(schema);
+            let eq_properties =
+                datafusion::physical_expr::EquivalenceProperties::new(projected_schema.clone());
             let partitioning = datafusion::physical_plan::Partitioning::UnknownPartitioning(1);
             let emission_type =
                 datafusion::physical_plan::execution_plan::EmissionType::Incremental;
@@ -273,24 +274,23 @@ impl ExecutionPlan for CustomInsertIntoExec {
         let schema = self.schema.clone();
 
         let stream = futures::stream::once(async move {
-            let mut buffer = Vec::new();
+            // let mut buffer = Vec::new();
 
             let mut count = 0;
 
             while let Some(batch) = data.next().await {
                 let batch = batch?;
 
-                let guard = db.db.lock().unwrap();
-                let mut writer = FileWriter::try_new(&mut buffer, &schema)?;
+                let mut guard = db.db.lock().unwrap();
 
-                writer.write(&batch)?;
-                writer.finish()?;
-
-                guard.insert("test", buffer.as_slice()).unwrap();
+                TableGuard {
+                    schema: schema.clone(),
+                    tree: &mut guard,
+                }
+                .write_batch(&batch)
+                .unwrap();
 
                 count += batch.num_rows();
-
-                buffer.clear();
             }
 
             Ok(make_count_batch(count as _))
@@ -365,69 +365,78 @@ impl ExecutionPlan for CustomExec {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream, DataFusionError> {
-        let guard = self.db.db.lock().unwrap();
+        let mut guard = self.db.db.lock().unwrap();
 
-        let values = guard.iter();
+        let cols = self.projected_schema.fields();
 
-        let mut record_batches = Vec::new();
-        let mut num_rows = 0;
+        // let values = guard.iter();
 
-        for value in values.values() {
-            let value = value.unwrap();
-            let slice: &[u8] = &value;
+        // let mut record_batches = Vec::new();
+        // let mut num_rows = 0;
 
-            let cursor = Cursor::new(slice);
-
-            let reader = FileReader::try_new(cursor, None).unwrap();
-            for batch in reader {
-                let batch = batch.unwrap();
-                num_rows += batch.num_rows();
-                record_batches.push(batch);
-            }
+        let record_batches = TableGuard {
+            schema: self.schema(),
+            tree: &mut guard,
         }
+        .read_batch(cols.iter().map(|x| x.name().as_str()).collect())
+        .unwrap();
 
-        eprintln!("Read: {}", num_rows);
+        // for value in values.values() {
+        //     let value = value.unwrap();
+        //     let slice: &[u8] = &value;
+
+        //     let cursor = Cursor::new(slice);
+
+        //     let reader = FileReader::try_new(cursor, None).unwrap();
+        //     for batch in reader {
+        //         let batch = batch.unwrap();
+        //         num_rows += batch.num_rows();
+        //         record_batches.push(batch);
+        //     }
+        // }
+
+        // eprintln!("Read: {}", num_rows);
 
         Ok(Box::pin(MemoryStream::try_new(
             record_batches,
-            self.schema(),
+            self.projected_schema.clone(),
             None,
         )?))
     }
 }
 
 use datafusion::execution::context::SessionContext;
+use sled_exp::TableGuard;
 
 #[tokio::main]
 async fn main() {
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        "foo",
-        datafusion::arrow::datatypes::DataType::Int64,
-        false,
-    )]));
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("foo", datafusion::arrow::datatypes::DataType::Int64, false),
+        Field::new("bar", datafusion::arrow::datatypes::DataType::Int64, false),
+    ]));
 
     let config = sled::Config::new().path("test.db");
 
     let sled = SledDb::new(&config).unwrap();
-    sled.register_table("foo", schema.clone()).unwrap();
+    sled.register_table("test_table", schema.clone()).unwrap();
 
     // Register tables into their own namespace:
     let ctx = SessionContext::new();
 
-    let table = sled.get_table("foo").unwrap().unwrap();
+    let table = sled.get_table("test_table").unwrap().unwrap();
 
-    ctx.register_table("foo", Arc::new(table)).unwrap();
+    ctx.register_table("test_table", Arc::new(table)).unwrap();
 
     let df = ctx
         .sql(
             r#"
-INSERT INTO foo
+INSERT INTO test_table
 VALUES
-(10),
-(20),
-(30),
-(40),
-(50);
+(10, 500),
+(20, 600),
+(30, 700),
+(40, 800),
+(50, 900);
 "#,
         )
         .await
@@ -435,7 +444,11 @@ VALUES
 
     df.show().await.unwrap();
 
-    let df = ctx.sql("SELECT * FROM foo").await.unwrap();
+    let df = ctx.sql("SELECT foo FROM test_table").await.unwrap();
+
+    df.show().await.unwrap();
+
+    let df = ctx.sql("SELECT bar FROM test_table").await.unwrap();
 
     df.show().await.unwrap();
 

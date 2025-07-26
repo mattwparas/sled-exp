@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -117,9 +118,9 @@ struct TableState {
     row_count: usize,
 }
 
-struct TableGuard<'a> {
-    schema: SchemaRef,
-    tree: &'a mut Tree<1024>,
+pub struct TableGuard<'a> {
+    pub schema: SchemaRef,
+    pub tree: &'a mut Tree<1024>,
 }
 
 pub static ROW_COUNT_KEY: std::sync::LazyLock<Vec<u8>> =
@@ -127,15 +128,21 @@ pub static ROW_COUNT_KEY: std::sync::LazyLock<Vec<u8>> =
 
 impl<'a> TableGuard<'a> {
     // The table needs to be locked for this whole duration.
-    pub fn write_batch(&mut self, batch: RecordBatch) -> Result<(), ArrowError> {
+    pub fn write_batch(&mut self, batch: &RecordBatch) -> Result<(), ArrowError> {
         // Check that the schemas are correct
         debug_assert!(batch.schema_ref() == &self.schema);
 
         // TODO: Insert #%rowcount into table first!
-        let row_count = self.tree.get(ROW_COUNT_KEY.as_slice()).unwrap().unwrap();
-        let row_count: usize = bincode::decode_from_slice(&row_count, bincode::config::standard())
+        let row_count: usize = self
+            .tree
+            .get(ROW_COUNT_KEY.as_slice())
             .unwrap()
-            .0;
+            .map(|row_count| {
+                bincode::decode_from_slice(&row_count, bincode::config::standard())
+                    .unwrap()
+                    .0
+            })
+            .unwrap_or(0);
 
         let mut sled_batch = sled::Batch::default();
 
@@ -166,6 +173,44 @@ impl<'a> TableGuard<'a> {
         self.tree.apply_batch(sled_batch).unwrap();
 
         Ok(())
+    }
+
+    pub fn read_batch<'b>(&mut self, cols: Vec<&'b str>) -> Result<Vec<RecordBatch>, ArrowError> {
+        // Go through and build up some batches
+        let mut batches = Vec::new();
+
+        let mut col_map: HashMap<_, Vec<RecordBatch>> =
+            cols.iter().map(|x| (x, Vec::new())).collect();
+
+        for name in cols.iter() {
+            let name = *name;
+            let batches = self
+                .tree
+                .scan_prefix(KeyKindQuery::Column { name }.encode());
+
+            for batch in batches {
+                let (_, batch) = batch.unwrap();
+                let decoded = decode_record_batch(&batch).unwrap();
+                // Unfurl the record batch. Could also eagerly combine them?
+                col_map.get_mut(&name).unwrap().extend(decoded);
+            }
+        }
+
+        let batch_length = col_map.iter().next().unwrap().1.len();
+
+        for i in 0..batch_length {
+            let mut local_batch = Vec::new();
+
+            for col in &cols {
+                local_batch.push(col_map.get(col).unwrap()[i].clone());
+            }
+
+            let merged = merge_batches(local_batch).unwrap();
+
+            batches.push(merged);
+        }
+
+        Ok(batches)
     }
 }
 
@@ -210,9 +255,16 @@ impl<'a> KeyKind<'a> {
 #[repr(C)]
 #[derive(Encode, BorrowDecode)]
 enum KeyKindQuery<'a> {
-    Column { name: &'a [u8] },
+    Column { name: &'a str },
     Row { key: &'a [u8] },
     RecordBatchIndex { name: &'a str },
+}
+
+impl<'a> KeyKindQuery<'a> {
+    // Encode the key kind
+    pub fn encode(&self) -> Vec<u8> {
+        bincode::encode_to_vec(&self, bincode::config::standard()).unwrap()
+    }
 }
 
 #[test]
@@ -276,9 +328,7 @@ fn test_keys() {
     .unwrap();
 
     let prefix = bincode::encode_to_vec(
-        KeyKindQuery::Column {
-            name: "foo".as_bytes(),
-        },
+        KeyKindQuery::Column { name: "foo" },
         bincode::config::standard(),
     )
     .unwrap();
@@ -300,7 +350,7 @@ fn test_keys() {
 
 // Split up a record batch of smaller record batches.
 // Each column will have its own thing.
-pub fn split_record_batch(batch: RecordBatch) -> Result<Vec<RecordBatch>, ArrowError> {
+pub fn split_record_batch(batch: &RecordBatch) -> Result<Vec<RecordBatch>, ArrowError> {
     (0..batch.columns().len())
         .into_iter()
         .map(|col| batch.project(&[col]))
