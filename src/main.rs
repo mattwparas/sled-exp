@@ -406,7 +406,7 @@ async fn main() {
         false,
     )]));
 
-    let config = sled::Config::new().path("test.db").flush_every_ms(to);
+    let config = sled::Config::new().path("test.db");
 
     let sled = SledDb::new(&config).unwrap();
     sled.register_table("foo", schema.clone()).unwrap();

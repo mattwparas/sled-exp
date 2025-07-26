@@ -1,3 +1,4 @@
+use std::io::Cursor;
 use std::sync::Arc;
 
 use arrow::array::AsArray;
@@ -32,6 +33,8 @@ use arrow::datatypes::UInt8Type;
 use arrow::datatypes::UInt16Type;
 use arrow::datatypes::UInt32Type;
 use arrow::datatypes::UInt64Type;
+use arrow::ipc::reader::FileReader;
+use arrow::ipc::writer::FileWriter;
 use arrow_array::ArrowPrimitiveType;
 use arrow_array::BinaryArray;
 use arrow_array::BinaryArrayType;
@@ -249,11 +252,123 @@ fn test_keys() {
     }
 }
 
+// Split up a record batch of smaller record batches.
+// Each column will have its own thing.
+pub fn split_record_batch(batch: RecordBatch) -> Result<Vec<RecordBatch>, ArrowError> {
+    (0..batch.columns().len())
+        .into_iter()
+        .map(|col| batch.project(&[col]))
+        .collect()
+}
+
+pub fn merge_batches(batches: Vec<RecordBatch>) -> Result<RecordBatch, ArrowError> {
+    let mut schema = SchemaBuilder::new();
+
+    for batch in &batches {
+        // I'd expect that the batches here are only of length 1
+        // given the way we're splitting things up above.
+        debug_assert!(batch.columns().len() == 1);
+
+        let col_schema = batch.schema();
+
+        for field in col_schema.fields() {
+            schema.try_merge(field)?;
+        }
+
+        let metadata = schema.metadata_mut();
+        for (key, value) in col_schema.metadata() {
+            metadata.insert(key.to_owned(), value.to_owned());
+        }
+    }
+
+    // Merge all the columns
+    let columns = batches
+        .into_iter()
+        .flat_map(|x| x.columns().to_vec())
+        .collect();
+
+    RecordBatch::try_new(Arc::new(schema.finish()), columns)
+}
+
+// Encode the individual record batch into something that we can use
+fn encode_record_batch_into(batch: &RecordBatch, buffer: &mut Vec<u8>) -> Result<(), ArrowError> {
+    let schema = batch.schema();
+    let mut writer = FileWriter::try_new(buffer, &schema)?;
+    writer.write(&batch)?;
+    writer.finish()?;
+    Ok(())
+}
+
+fn encode_record_batch(batch: &RecordBatch) -> Result<Vec<u8>, ArrowError> {
+    let mut buffer = Vec::new();
+    encode_record_batch_into(batch, &mut buffer)?;
+    Ok(buffer)
+}
+
+fn decode_record_batch(batch: &[u8]) -> Result<Vec<RecordBatch>, ArrowError> {
+    let cursor = Cursor::new(batch);
+    let mut record_batches = Vec::new();
+
+    let reader = FileReader::try_new(cursor, None).unwrap();
+    for batch in reader {
+        let batch = batch.unwrap();
+        record_batches.push(batch);
+    }
+
+    Ok(record_batches)
+}
+
+#[derive(Debug)]
+struct ColumnRecord {
+    batch: RecordBatch,
+}
+
+impl Encode for ColumnRecord {
+    fn encode<E: bincode::enc::Encoder>(
+        &self,
+        encoder: &mut E,
+    ) -> Result<(), bincode::error::EncodeError> {
+        let batch = encode_record_batch(&self.batch).unwrap();
+        Encode::encode(&batch, encoder)
+    }
+}
+
+impl<Context> Decode<Context> for ColumnRecord {
+    fn decode<D: bincode::de::Decoder<Context = Context>>(
+        decoder: &mut D,
+    ) -> Result<Self, bincode::error::DecodeError> {
+        let bytes = Vec::<u8>::decode(decoder)?;
+        let batch = decode_record_batch(&bytes)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+
+        Ok(ColumnRecord { batch })
+    }
+}
+
+// Why is this the same as the above?
+impl<'de, Context> BorrowDecode<'de, Context> for ColumnRecord {
+    fn borrow_decode<D: bincode::de::BorrowDecoder<'de, Context = Context>>(
+        decoder: &mut D,
+    ) -> Result<Self, bincode::error::DecodeError> {
+        let bytes = Vec::<u8>::decode(decoder)?;
+        let batch = decode_record_batch(&bytes)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+
+        Ok(ColumnRecord { batch })
+    }
+}
+
 #[derive(Encode, Decode, Debug)]
 enum ValueKind {
     // TODO: Implement encoding logic here!
     // Each column will be encoded in its own record batch
-    // Column(RecordBatch),
+    Column(ColumnRecord),
 
     // Separately encode a row, if the row was inserted on its own
     Row(ArrowRow),
