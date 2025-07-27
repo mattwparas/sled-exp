@@ -234,8 +234,8 @@ enum KeyKind<'a> {
     // that matches a specific column.
     Column { name: &'a str, row_offset: usize },
 
-    // Row will be indexed via primary key.
-    Row { key: &'a [u8] },
+    // Row will be indexed via primary key?
+    Row { key: &'a str, row_offset: usize },
 
     // Primary key for a record batch. Optionally can
     // index into a record batch in order to tell us
@@ -256,7 +256,7 @@ impl<'a> KeyKind<'a> {
 #[derive(Encode, BorrowDecode)]
 enum KeyKindQuery<'a> {
     Column { name: &'a str },
-    Row { key: &'a [u8] },
+    Row { key: &'a str },
     RecordBatchIndex { name: &'a str },
 }
 
