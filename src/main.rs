@@ -40,7 +40,8 @@ struct SledDb {
 impl SledDb {
     pub fn new(config: &sled::Config) -> std::io::Result<Self> {
         let db = Db::open_with_config(config)?;
-        let schemas = db.open_tree("schemas")?;
+        // Special schema table which holds the table schemas
+        let schemas = db.open_tree("#%schemas")?;
 
         Ok(Self {
             db: Arc::new(Mutex::new(db)),
@@ -407,7 +408,7 @@ impl ExecutionPlan for CustomExec {
 
 impl CatalogProvider for SledDb {
     fn as_any(&self) -> &dyn Any {
-        todo!()
+        self
     }
 
     fn schema_names(&self) -> Vec<String> {
