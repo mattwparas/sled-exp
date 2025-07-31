@@ -32,6 +32,8 @@ use sled::{Db, Tree};
 #[derive(Debug, Clone)]
 struct SledDb {
     db: Arc<Mutex<Db<1024>>>,
+    // Just put the schema field as part of the
+    // table itself?
     schemas: Arc<Mutex<Tree<1024>>>,
     // TODO: Cache these tables?
     open_tables: HashMap<String, Arc<SledTable>>,
